@@ -494,6 +494,12 @@ class CANMonitorEnhancedGUI(QMainWindow):
         self.last_save_time = 0
         self.save_counter = 0
         
+        # 初始化手动数据记录相关变量
+        self.data_recording_enabled = False
+        self.recorded_time_data = []
+        self.recorded_plot_data = {}
+        self.recording_start_time = 0
+        
     def init_ui(self):
         self.setWindowTitle("50KW伺服控制器CAN数据监测")
         self.setGeometry(100, 100, 1400, 900)
@@ -1525,8 +1531,8 @@ class CANMonitorEnhancedGUI(QMainWindow):
         button_layout.addStretch()
         
         # 保存数据按钮
-        self.save_btn = QPushButton("保存数据")
-        self.save_btn.clicked.connect(self.save_data)
+        self.save_btn = QPushButton("开始记录")
+        self.save_btn.clicked.connect(self.toggle_data_recording)
         button_layout.addWidget(self.save_btn)
 
         # 图例显示控制按钮
@@ -1956,52 +1962,6 @@ class CANMonitorEnhancedGUI(QMainWindow):
             pass
         
 
-    def save_data(self):
-        """保存数据到文件"""
-        try:
-            from PyQt5.QtWidgets import QFileDialog
-            filename, _ = QFileDialog.getSaveFileName(
-                self, "保存数据", "", "文本文件 (*.txt);;所有文件 (*)"
-            )
-            
-            if filename:
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write("=== CAN数据监控记录 ===\n")
-                    f.write(f"记录时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                    
-                    # 写入解析数据
-                    f.write("=== 解析数据 ===\n")
-                    # 定义数据项名称映射
-                    param_names = {
-                        'displacement_cmd': '位移指令',
-                        'displacement_feedback': '位移反馈',
-                        'motor_speed': '电机转速',
-                        'pressure5': '压力5',
-                        'dc_voltage': 'DC母线电压',
-                        'motor_id_current': '电机Id电流',
-                        'motor_iq_current': '电机Iq电流',
-                        'igbt_temp': 'IGBT温度',
-                        'motor_ia_current': '电机Ia电流',
-                        'motor_ib_current': '电机Ib电流',
-                        'pt100_a': 'PT100-A',
-                        'pt100_b': 'PT100-B',
-                        'pt100_c': 'PT100-C',
-                        'pressure1': '压力1',
-                        'pressure2': '压力2',
-                        'pressure3': '压力3',
-                        'pressure4': '压力4'
-                    }
-                    
-                    for param_name, label_info in self.data_labels.items():
-                        param_label = param_names.get(param_name, param_name)
-                        value = label_info['label'].text().split(': ')[1]
-                        f.write(f"{param_label}: {value}\n")
-                    
-                QMessageBox.information(self, "成功", f"数据已保存到: {filename}")
-                
-        except Exception as e:
-            QMessageBox.critical(self, "错误", f"保存数据失败: {str(e)}")
-            
     def send_command_frame(self):
         if not self.chn_handle:
             QMessageBox.warning(self, "警告", "请先打开设备!")
@@ -2195,6 +2155,34 @@ class CANMonitorEnhancedGUI(QMainWindow):
                             self.plot_data[param_name].append(self.plot_data[param_name][-1])
                         else:
                             self.plot_data[param_name].append(np.nan)
+                
+                # 如果启用了数据记录，同时记录到记录数组中
+                if self.data_recording_enabled:
+                    # 记录时间数据（相对于记录开始时间）
+                    record_time = current_time - self.recording_start_time
+                    self.recorded_time_data.append(record_time)
+                    
+                    # 记录各参数数据
+                    for param_name in self.plot_data:
+                        if param_name not in self.recorded_plot_data:
+                            self.recorded_plot_data[param_name] = []
+                        
+                        if param_name in parsed_dict:
+                            value = parsed_dict[param_name]
+                            if isinstance(value, (int, float)) and not np.isnan(value) and not np.isinf(value):
+                                self.recorded_plot_data[param_name].append(value)
+                            else:
+                                # 如果数值无效，使用上一个值或NaN
+                                if self.recorded_plot_data[param_name]:
+                                    self.recorded_plot_data[param_name].append(self.recorded_plot_data[param_name][-1])
+                                else:
+                                    self.recorded_plot_data[param_name].append(np.nan)
+                        else:
+                            # 如果没有新数据，保持上一个值或使用NaN
+                            if self.recorded_plot_data[param_name]:
+                                self.recorded_plot_data[param_name].append(self.recorded_plot_data[param_name][-1])
+                            else:
+                                self.recorded_plot_data[param_name].append(np.nan)
             
             # 简单的滑动窗口数据管理：保持固定大小的数据窗口
             window_size = 3600  # 保持1小时的数据（3600个数据点，10Hz采样）
@@ -2324,12 +2312,129 @@ class CANMonitorEnhancedGUI(QMainWindow):
         if ret != 1:
             pass  # 静默处理发送失败
             
+    def toggle_data_recording(self):
+        """切换数据记录状态"""
+        if not self.data_recording_enabled:
+            # 开始记录
+            self.data_recording_enabled = True
+            self.recording_start_time = time.time() - self._start_time if hasattr(self, '_start_time') else 0
+            self.recorded_time_data = []
+            self.recorded_plot_data = {}
+            
+            # 初始化记录数据数组
+            param_names = [
+                'displacement_cmd', 'displacement_feedback', 'motor_speed', 'pressure5',
+                'dc_voltage', 'motor_id_current', 'motor_iq_current', 'igbt_temp',
+                'motor_ia_current', 'motor_ib_current', 'pt100_a', 'pt100_b', 'pt100_c',
+                'pressure1', 'pressure2', 'pressure3', 'pressure4'
+            ]
+            for param_name in param_names:
+                self.recorded_plot_data[param_name] = []
+            
+            # 暂停自动保存功能
+            if self.auto_save_enabled:
+                self.auto_save_btn.setChecked(False)
+                self.auto_save_enabled = False
+                self.stop_auto_save()
+                self.statusBar().showMessage("数据记录已开始 - 自动保存已暂停")
+            else:
+                self.statusBar().showMessage("数据记录已开始")
+            
+            # 更新按钮文字
+            self.save_btn.setText("停止记录")
+        else:
+            # 停止记录并保存
+            self.data_recording_enabled = False
+            self.save_recorded_data()
+            
+            # 更新按钮文字
+            self.save_btn.setText("开始记录")
+            self.statusBar().showMessage("数据记录已停止")
+    
+    def save_recorded_data(self):
+        """保存记录的数据"""
+        try:
+            # 检查是否有记录的数据
+            if not self.recorded_time_data or len(self.recorded_time_data) == 0:
+                QMessageBox.warning(self, "警告", "没有记录的数据可保存!")
+                return
+            
+            # 创建result文件夹
+            result_dir = "result"
+            if not os.path.exists(result_dir):
+                os.makedirs(result_dir)
+            
+            # 生成文件名（包含时间戳）
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = f"manual_record_{timestamp}.csv"
+            filepath = os.path.join(result_dir, filename)
+            
+            # 准备保存的数据
+            save_data = []
+            
+            # 添加时间列
+            time_column = ["时间(s)"] + [f"{t:.3f}" for t in self.recorded_time_data]
+            save_data.append(time_column)
+            
+            # 添加各参数的数据列
+            param_names_cn = {
+                "displacement_cmd": "位移指令(mm)",
+                "displacement_feedback": "位移反馈(mm)",
+                "motor_speed": "电机转速(r/min)",
+                "pressure5": "压力5(Mpa)",
+                "dc_voltage": "DC母线电压(V)",
+                "motor_id_current": "电机Id电流(A)",
+                "motor_iq_current": "电机Iq电流(A)",
+                "igbt_temp": "IGBT温度(°C)",
+                "motor_ia_current": "电机Ia电流(A)",
+                "motor_ib_current": "电机Ib电流(A)",
+                "pt100_a": "PT100-A(°C)",
+                "pt100_b": "PT100-B(°C)",
+                "pt100_c": "PT100-C(°C)",
+                "pressure1": "压力1(Mpa)",
+                "pressure2": "压力2(Mpa)",
+                "pressure3": "压力3(Mpa)",
+                "pressure4": "压力4(Mpa)"
+            }
+            
+            for param_name, param_cn in param_names_cn.items():
+                if param_name in self.recorded_plot_data and len(self.recorded_plot_data[param_name]) > 0:
+                    # 确保数据长度与时间数据一致
+                    data_length = min(len(self.recorded_time_data), len(self.recorded_plot_data[param_name]))
+                    param_data = [param_cn] + [f"{self.recorded_plot_data[param_name][i]:.3f}" if i < len(self.recorded_plot_data[param_name]) else "" for i in range(data_length)]
+                    save_data.append(param_data)
+            
+            # 保存为CSV文件
+            with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
+                import csv
+                writer = csv.writer(f)
+                # 转置数据以正确的格式写入
+                max_length = max(len(row) for row in save_data)
+                for i in range(max_length):
+                    row = []
+                    for col in save_data:
+                        if i < len(col):
+                            row.append(col[i])
+                        else:
+                            row.append("")
+                    writer.writerow(row)
+            
+            # 显示成功消息
+            QMessageBox.information(self, "成功", f"记录数据已保存到: {filename}\n记录时长: {self.recorded_time_data[-1]:.1f}秒\n数据点数: {len(self.recorded_time_data)}")
+            
+            # 清空记录数据
+            self.recorded_time_data = []
+            self.recorded_plot_data = {}
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存记录数据失败: {str(e)}")
+    
     def toggle_auto_save(self):
         """切换自动保存状态"""
         if self.auto_save_btn.isChecked():
             self.auto_save_enabled = True
             self.start_auto_save()
-            self.statusBar().showMessage("自动保存已启动 - 每5分钟保存一次数据")
+            self.statusBar().showMessage("自动保存已启动 - 每10分钟保存一次数据")
         else:
             self.auto_save_enabled = False
             self.stop_auto_save()
@@ -2340,7 +2445,7 @@ class CANMonitorEnhancedGUI(QMainWindow):
         if not self.auto_save_timer:
             self.auto_save_timer = QTimer()
             self.auto_save_timer.timeout.connect(self.auto_save_data)
-            self.auto_save_timer.start(300000)  # 5分钟 = 300000毫秒
+            self.auto_save_timer.start(600000)  # 10分钟 = 600000毫秒
             self.last_save_time = time.time()
     
     def stop_auto_save(self):
@@ -2451,11 +2556,7 @@ class CANMonitorEnhancedGUI(QMainWindow):
             event.accept()
         except Exception as e:
             event.accept()
-
-
-    
-
-            
+           
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')  # 使用Fusion样式，看起来更现代
