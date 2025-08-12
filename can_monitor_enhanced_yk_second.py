@@ -1,3 +1,18 @@
+"""
+CAN通讯协议增强版监控程序
+协议要求：
+- 波特率：500K
+- 扩展帧格式
+- 先传高字节，再传低字节（大端序）
+- 传输周期：5ms
+
+控制信息：
+位移指令：
+- CAN ID: 0x01121101
+- Byte0: 0xFF表示指令有效，其他表示指令无效
+- Byte1~Byte4: 位移指令，无符号整型，0.01mm量纲
+"""
+
 import sys
 import time
 import struct
@@ -20,20 +35,19 @@ class CANDataParser:
     
     @staticmethod
     def parse_frame_1111201(data):
-        """解析第1帧数据"""
+        """解析第1帧数据 (位移指令和位移反馈)"""
         if len(data) < 8:
             return None
             
-        displacement_cmd = struct.unpack('>H', data[0:2])[0]  # 位移指令 (大端序)
-        displacement_feedback = struct.unpack('>H', data[2:4])[0]  # 位移反馈 (大端序)
-        motor_speed = struct.unpack('>h', data[4:6])[0]  # 电机转速 (有符号，大端序)
-        pressure5 = struct.unpack('>H', data[6:8])[0]  # 压力5 (大端序)
+        # Byte0~Byte3: 位移指令 (无符号整型，0.01mm)
+        displacement_cmd = int.from_bytes(data[0:4], byteorder='big', signed=False)
+        
+        # Byte4~Byte7: 位移反馈 (无符号整型，0.01mm)
+        displacement_feedback = int.from_bytes(data[4:8], byteorder='big', signed=False)
         
         return {
-            'displacement_cmd': displacement_cmd * 0.01,  # mm
-            'displacement_feedback': displacement_feedback * 0.01,  # mm
-            'motor_speed': motor_speed,  # r/min
-            'pressure5': pressure5 * 0.1  # Mpa
+            'displacement_cmd': displacement_cmd * 0.01,      # mm
+            'displacement_feedback': displacement_feedback * 0.01  # mm
         }
     
     @staticmethod
@@ -94,21 +108,21 @@ class CANDataParser:
     
     @staticmethod
     def parse_frame_1111205(data):
-        """解析第5帧数据 (报警信息和电磁阀状态)"""
-        if len(data) < 2:
+        """解析第5帧数据 (报警信息、电磁阀状态、电机转速和压力5)"""
+        if len(data) < 8:
             return None
             
         # Byte0: 报警信息
         alarm_byte = data[0]
         alarms = {
-            'low_pressure_low': bool(alarm_byte & 0x01),      # Bit0: 低压过低报警
-            'low_pressure_high': bool(alarm_byte & 0x02),     # Bit1: 低压过高报警
-            'displacement_limit': bool(alarm_byte & 0x04),    # Bit2: 位移超限报警
-            'motor_overspeed': bool(alarm_byte & 0x08),       # Bit3: 电机超速报警
-            'motor_overcurrent': bool(alarm_byte & 0x10),     # Bit4: 电机过流报警
-            'igbt_overtemp': bool(alarm_byte & 0x20),         # Bit5: IGBT过温报警
-            'dc_voltage_over': bool(alarm_byte & 0x40),       # Bit6: 母线电压过压报警
-            'dc_voltage_under': bool(alarm_byte & 0x80)       # Bit7: 母线电压欠压报警
+            'low_pressure_low': bool(alarm_byte & 0x01),      # Bit0: 低压过低报警 (1故障，0正常)
+            'low_pressure_high': bool(alarm_byte & 0x02),     # Bit1: 低压过高报警 (1故障，0正常)
+            'displacement_limit': bool(alarm_byte & 0x04),    # Bit2: 位移超限报警 (1故障，0正常)
+            'motor_overspeed': bool(alarm_byte & 0x08),       # Bit3: 电机超速报警 (1故障，0正常)
+            'motor_overcurrent': bool(alarm_byte & 0x10),     # Bit4: 电机过流报警 (运控自定)
+            'igbt_overtemp': bool(alarm_byte & 0x20),         # Bit5: IGBT过温报警 (运控自定)
+            'dc_voltage_over': bool(alarm_byte & 0x40),       # Bit6: 母线电压过压报警 (运控自定)
+            'dc_voltage_under': bool(alarm_byte & 0x80)       # Bit7: 母线电压欠压报警 (运控自定)
         }
         
         # Byte1: 电磁阀状态和故障信息
@@ -117,14 +131,30 @@ class CANDataParser:
             'solenoid0_status': bool(solenoid_byte & 0x01),   # Bit0: 电磁阀0状态 (1打开)
             'solenoid1_status': bool(solenoid_byte & 0x02),   # Bit1: 电磁阀1状态 (1打开)
             'solenoid2_status': bool(solenoid_byte & 0x04),   # Bit2: 电磁阀2状态 (1打开)
-            'solenoid0_fault': bool(solenoid_byte & 0x08),    # Bit3: 电磁阀0故障报警
-            'solenoid1_fault': bool(solenoid_byte & 0x10),    # Bit4: 电磁阀1故障报警
-            'solenoid2_fault': bool(solenoid_byte & 0x20),    # Bit5: 电磁阀2故障报警
+            'solenoid0_fault': bool(solenoid_byte & 0x08),    # Bit3: 电磁阀0打开或关闭失败报警 (默认0)
+            'solenoid1_fault': bool(solenoid_byte & 0x10),    # Bit4: 电磁阀1打开或关闭失败报警 (默认0)
+            'solenoid2_fault': bool(solenoid_byte & 0x20),    # Bit5: 电磁阀2打开或关闭失败报警 (默认0)
+            'reserved_bit6': bool(solenoid_byte & 0x40),      # Bit6: 预留
+            'reserved_bit7': bool(solenoid_byte & 0x80)       # Bit7: 预留
         }
+        
+        # Byte2-Byte3: 预留
+        reserved_2_3 = data[2:4]
+        
+        # Byte4-Byte5: 电机转速 (二进制补码，单位1r/min)
+        motor_speed_raw = int.from_bytes(data[4:6], byteorder='big', signed=True)
+        motor_speed = motor_speed_raw  # 单位：r/min
+        
+        # Byte6-Byte7: 压力5 (无符号整型，单位0.1Mpa)
+        pressure5_raw = int.from_bytes(data[6:8], byteorder='big', signed=False)
+        pressure5 = pressure5_raw * 0.1  # 单位：Mpa
         
         return {
             'alarms': alarms,
-            'solenoid_status': solenoid_status
+            'solenoid_status': solenoid_status,
+            'reserved_2_3': reserved_2_3,
+            'motor_speed': motor_speed,  # r/min
+            'pressure5': pressure5      # Mpa
         }
 
 class SerialCommunication:
@@ -527,7 +557,10 @@ class CANMonitorEnhancedGUI(QMainWindow):
         self.statusBar().showMessage("就绪")
         
     def create_device_control_group(self, parent_layout):
-        """创建设备控制组"""
+        """
+        创建设备控制组
+        根据协议要求：波特率500K，扩展帧格式
+        """
         group = QGroupBox("设备控制")
         layout = QGridLayout()
         
@@ -554,13 +587,13 @@ class CANMonitorEnhancedGUI(QMainWindow):
         self.channel_combo.addItems(["通道0", "通道1"])
         layout.addWidget(self.channel_combo, 1, 1)
         
-        # 波特率选择
+        # 波特率选择（协议要求：500K）
         layout.addWidget(QLabel("波特率:"), 1, 2)
         self.baudrate_combo = QComboBox()
         self.baudrate_combo.addItems([
             "100000", "250000", "500000", "1000000"
         ])
-        self.baudrate_combo.setCurrentText("500000")
+        self.baudrate_combo.setCurrentText("500000")  # 默认500K，符合协议要求
         layout.addWidget(self.baudrate_combo, 1, 3)
         
         # 打开设备按钮
@@ -606,7 +639,7 @@ class CANMonitorEnhancedGUI(QMainWindow):
         
         # 指令数值输入
         self.cmd_value_input = QDoubleSpinBox()
-        self.cmd_value_input.setRange(-32768, 65535)
+        self.cmd_value_input.setRange(0, 1500)  # 位移指令范围：0-1500mm
         self.cmd_value_input.setValue(0)
         self.cmd_value_input.setDecimals(2)  # 支持2位小数
         cmd_layout.addWidget(QLabel("指令数值:"))
@@ -637,8 +670,8 @@ class CANMonitorEnhancedGUI(QMainWindow):
         # 正弦指令参数 - 单行布局
         sine_layout.addWidget(QLabel("中心:"))
         self.sine_center_spin = QDoubleSpinBox()
-        self.sine_center_spin.setRange(0, 1000)
-        self.sine_center_spin.setValue(160)  # 默认中心位移160mm
+        self.sine_center_spin.setRange(0, 1500)  # 中心位移范围：0-1500mm
+        self.sine_center_spin.setValue(750)  # 默认中心位移750mm（1500/2）
         self.sine_center_spin.setSuffix(" mm")
         self.sine_center_spin.setDecimals(1)
         self.sine_center_spin.setMinimumWidth(120)  # 进一步增加最小宽度
@@ -647,8 +680,8 @@ class CANMonitorEnhancedGUI(QMainWindow):
         
         sine_layout.addWidget(QLabel("振幅:"))
         self.sine_amplitude_spin = QDoubleSpinBox()
-        self.sine_amplitude_spin.setRange(0, 500)
-        self.sine_amplitude_spin.setValue(100)  # 默认振幅100mm
+        self.sine_amplitude_spin.setRange(0, 750)  # 振幅范围：0-750mm（确保中心±振幅不超过1500）
+        self.sine_amplitude_spin.setValue(200)  # 默认振幅200mm
         self.sine_amplitude_spin.setSuffix(" mm")
         self.sine_amplitude_spin.setDecimals(1)
         self.sine_amplitude_spin.setMinimumWidth(120)  # 进一步增加最小宽度
@@ -731,7 +764,7 @@ class CANMonitorEnhancedGUI(QMainWindow):
         """指令类型改变时的处理"""
         if cmd_type == "位移指令":
             self.unit_label.setText("mm")
-            self.cmd_value_input.setRange(0, 655.35)  # 位移范围：0-655.35mm
+            self.cmd_value_input.setRange(0, 1500)  # 位移范围：0-1500mm
             self.cmd_value_input.setSuffix(" mm")
             self.cmd_value_input.setDecimals(2)  # 支持2位小数
             # 更新使能控制标签
@@ -1300,7 +1333,7 @@ class CANMonitorEnhancedGUI(QMainWindow):
     def update_plot_curve(self, param_name, time_array, value_array):
         """更新绘图曲线"""
         try:
-            
+                
             # 检查参数是否存在于曲线字典中
             if param_name not in self.plot_curves:
                 return
@@ -1730,7 +1763,7 @@ class CANMonitorEnhancedGUI(QMainWindow):
             self.update_frame_1111205(data)
             
     def update_frame_1111201(self, data):
-        """更新第1帧数据"""
+        """更新第1帧数据 (位移指令和位移反馈)"""
         parsed = self.parser.parse_frame_1111201(data)
         if parsed:
             # 立即更新UI显示，提高数据可见性
@@ -1738,18 +1771,15 @@ class CANMonitorEnhancedGUI(QMainWindow):
                 self.data_labels['displacement_cmd']['label'].setText(f"位移指令: {parsed['displacement_cmd']:.2f} mm")
             if 'displacement_feedback' in self.data_labels:
                 self.data_labels['displacement_feedback']['label'].setText(f"位移反馈: {parsed['displacement_feedback']:.2f} mm")
-            if 'motor_speed' in self.data_labels:
-                self.data_labels['motor_speed']['label'].setText(f"电机转速: {parsed['motor_speed']} r/min")
-            if 'pressure5' in self.data_labels:
-                self.data_labels['pressure5']['label'].setText(f"压力5: {parsed['pressure5']:.1f} Mpa")
+            # 注意：第1帧不包含电机转速和压力5，这些数据在第5帧中
             
             # 发送数据到串口
             if self.serial_comm.is_connected:
-                # 暂时使用默认值，等第2帧和第3帧数据到达后再发送完整数据
+                # 第1帧只包含位移指令和位移反馈，其他数据等后续帧
                 self.serial_comm.send_motor_data(
                     displacement_cmd=parsed['displacement_cmd'],
                     displacement_feedback=parsed['displacement_feedback'],
-                    motor_speed=parsed['motor_speed'],
+                    motor_speed=0.0,       # 暂时设为0，等第5帧数据
                     motor_id_current=0.0,  # 暂时设为0，等第2帧数据
                     dc_voltage=0.0,        # 暂时设为0，等第2帧数据
                     motor_iq_current=0.0,  # 暂时设为0，等第2帧数据
@@ -1782,7 +1812,7 @@ class CANMonitorEnhancedGUI(QMainWindow):
                     self.serial_comm.send_motor_data(
                         displacement_cmd=latest_frame1_data.get('displacement_cmd', 0.0),
                         displacement_feedback=latest_frame1_data.get('displacement_feedback', 0.0),
-                        motor_speed=latest_frame1_data.get('motor_speed', 0),
+                        motor_speed=0.0,       # 暂时设为0，等第5帧数据
                         motor_id_current=parsed['motor_id_current'],
                         dc_voltage=parsed['dc_voltage'],
                         motor_iq_current=parsed['motor_iq_current'],
@@ -1793,14 +1823,14 @@ class CANMonitorEnhancedGUI(QMainWindow):
             self.append_data_point(parsed)
     
     def get_latest_frame1_data(self):
-        """获取最新的第1帧数据"""
+        """获取最新的第1帧数据 (位移指令和位移反馈)"""
         # 从绘图数据中获取最新的第1帧数据
         if 'displacement_cmd' in self.plot_data and len(self.plot_data['displacement_cmd']) > 0:
             latest_index = len(self.plot_data['displacement_cmd']) - 1
             return {
                 'displacement_cmd': self.plot_data['displacement_cmd'][latest_index],
-                'displacement_feedback': self.plot_data['displacement_feedback'][latest_index] if 'displacement_feedback' in self.plot_data and len(self.plot_data['displacement_feedback']) > latest_index else 0.0,
-                'motor_speed': self.plot_data['motor_speed'][latest_index] if 'motor_speed' in self.plot_data and len(self.plot_data['motor_speed']) > latest_index else 0
+                'displacement_feedback': self.plot_data['displacement_feedback'][latest_index] if 'displacement_feedback' in self.plot_data and len(self.plot_data['displacement_feedback']) > latest_index else 0.0
+                # 注意：电机转速现在在第5帧中，不在这里获取
             }
         return None
     
@@ -1813,6 +1843,17 @@ class CANMonitorEnhancedGUI(QMainWindow):
                 'dc_voltage': self.plot_data['dc_voltage'][latest_index],
                 'motor_id_current': self.plot_data['motor_id_current'][latest_index] if 'motor_id_current' in self.plot_data and len(self.plot_data['motor_id_current']) > latest_index else 0.0,
                 'motor_iq_current': self.plot_data['motor_iq_current'][latest_index] if 'motor_iq_current' in self.plot_data and len(self.plot_data['motor_iq_current']) > latest_index else 0.0
+            }
+        return None
+    
+    def get_latest_frame3_data(self):
+        """获取最新的第3帧数据 (电机Ia/Ib电流)"""
+        # 从绘图数据中获取最新的第3帧数据
+        if 'motor_ia_current' in self.plot_data and len(self.plot_data['motor_ia_current']) > 0:
+            latest_index = len(self.plot_data['motor_ia_current']) - 1
+            return {
+                'motor_ia_current': self.plot_data['motor_ia_current'][latest_index],
+                'motor_ib_current': self.plot_data['motor_ib_current'][latest_index] if 'motor_ib_current' in self.plot_data and len(self.plot_data['motor_ib_current']) > latest_index else 0.0
             }
         return None
             
@@ -1842,7 +1883,7 @@ class CANMonitorEnhancedGUI(QMainWindow):
                     self.serial_comm.send_motor_data(
                         displacement_cmd=latest_frame1_data.get('displacement_cmd', 0.0),
                         displacement_feedback=latest_frame1_data.get('displacement_feedback', 0.0),
-                        motor_speed=latest_frame1_data.get('motor_speed', 0),
+                        motor_speed=0.0,       # 暂时设为0，等第5帧数据
                         motor_id_current=latest_frame2_data.get('motor_id_current', 0.0),
                         dc_voltage=latest_frame2_data.get('dc_voltage', 0.0),
                         motor_iq_current=latest_frame2_data.get('motor_iq_current', 0.0),
@@ -1868,9 +1909,15 @@ class CANMonitorEnhancedGUI(QMainWindow):
             self.append_data_point(parsed)
             
     def update_frame_1111205(self, data):
-        """更新第5帧数据 (报警信息和电磁阀状态)"""
+        """更新第5帧数据 (报警信息、电磁阀状态、电机转速和压力5)"""
         parsed = self.parser.parse_frame_1111205(data)
         if parsed:
+            # 更新电机转速和压力5显示
+            if 'motor_speed' in self.data_labels:
+                self.data_labels['motor_speed']['label'].setText(f"电机转速: {parsed.get('motor_speed', 0)} r/min")
+            if 'pressure5' in self.data_labels:
+                self.data_labels['pressure5']['label'].setText(f"压力5: {parsed.get('pressure5', 0):.1f} Mpa")
+            
             # 更新报警信息
             alarms = parsed['alarms']
             alarm_items = [
@@ -1908,6 +1955,25 @@ class CANMonitorEnhancedGUI(QMainWindow):
                         else:
                             status_info['status'].setText("关闭")
                             status_info['status'].setStyleSheet("QLabel { background-color: #D3D3D3; border: 1px solid #ccc; padding: 3px; color: gray; }")
+            
+            # 发送包含电机转速和压力5的完整数据到串口
+            if self.serial_comm.is_connected:
+                # 获取最新的第1帧、第2帧和第3帧数据
+                latest_frame1_data = self.get_latest_frame1_data()
+                latest_frame2_data = self.get_latest_frame2_data()
+                latest_frame3_data = self.get_latest_frame3_data()
+                
+                if latest_frame1_data and latest_frame2_data and latest_frame3_data:
+                    self.serial_comm.send_motor_data(
+                        displacement_cmd=latest_frame1_data.get('displacement_cmd', 0.0),
+                        displacement_feedback=latest_frame1_data.get('displacement_feedback', 0.0),
+                        motor_speed=parsed.get('motor_speed', 0),  # 从第5帧获取电机转速
+                        motor_id_current=latest_frame2_data.get('motor_id_current', 0.0),
+                        dc_voltage=latest_frame2_data.get('dc_voltage', 0.0),
+                        motor_iq_current=latest_frame2_data.get('motor_iq_current', 0.0),
+                        motor_ia_current=latest_frame3_data.get('motor_ia_current', 0.0),  # 从第3帧获取
+                        motor_ib_current=latest_frame3_data.get('motor_ib_current', 0.0)   # 从第3帧获取
+                    )
     
     def connect_serial(self):
         """连接串口"""
@@ -1961,6 +2027,12 @@ class CANMonitorEnhancedGUI(QMainWindow):
         
 
     def send_command_frame(self):
+        """
+        发送位移/速度指令帧
+        根据新协议要求：
+        - 位移指令：CAN ID 0x01121101，Byte0为0xFF表示有效，Byte1~Byte4为位移值（4字节，0.01mm量纲）
+        - 扩展帧格式，大端序传输
+        """
         if not self.chn_handle:
             QMessageBox.warning(self, "警告", "请先打开设备!")
             return
@@ -1980,13 +2052,20 @@ class CANMonitorEnhancedGUI(QMainWindow):
                 data[0] = 0x00  # 指令无效，位移非使能
                 enable_status = "非使能"
             
-            # 位移指令：输入mm值，转换为0.01mm单位
+            # 位移指令：输入mm值，转换为0.01mm单位，使用4个字节存储
+            # 根据协议：Byte1~Byte4为位移指令，无符号整型，0.01mm量纲
             # 例如：输入10.5mm，发送1050 (10.5 * 100)
             raw_value = int(value * 100)  # 转换为0.01mm单位
-            data[1:3] = raw_value.to_bytes(2, byteorder='big', signed=False)  # 大端序
+            data[1:5] = raw_value.to_bytes(4, byteorder='big', signed=False)  # 4字节，大端序，无符号
             
             # 显示发送信息
-            info_msg = f"发送位移指令: {value} mm (原始值: {raw_value}, 状态: {enable_status})"
+            data_hex = ' '.join([f'{b:02X}' for b in data])
+            info_msg = f"发送位移指令: {value} mm (原始值: {raw_value}, 状态: {enable_status}, 数据: {data_hex})"
+            
+            # 调试打印：16进制指令
+            print(f"[DEBUG] 位移指令 16进制: {data_hex}")
+            print(f"[DEBUG] CAN ID: 0x{can_id:08X}")
+            print(f"[DEBUG] 位移值: {value} mm -> {raw_value} (0.01mm单位)")
             
         else:  # 速度指令
             can_id = 0x01121010
@@ -2230,10 +2309,10 @@ class CANMonitorEnhancedGUI(QMainWindow):
         # 记录开始时间
         self.sine_start_time = time.time()
         
-        # 创建定时器，发送频率为50Hz (20ms间隔)
+        # 创建定时器，发送频率为200Hz (5ms间隔，符合协议要求)
         self.sine_timer = QTimer()
         self.sine_timer.timeout.connect(lambda: self.send_sine_frame(center, amplitude, frequency))
-        self.sine_timer.start(20)  # 20ms = 50Hz
+        self.sine_timer.start(5)  # 5ms = 200Hz，符合协议传输周期要求
         
         # 更新UI状态
         self.start_sine_btn.setEnabled(False)
@@ -2243,7 +2322,7 @@ class CANMonitorEnhancedGUI(QMainWindow):
         self.sine_frequency_spin.setEnabled(False)
         self.sine_enable_checkbox.setEnabled(False)
         
-        self.statusBar().showMessage(f"开始正弦指令 - 中心:{center}mm, 振幅:{amplitude}mm, 频率:{frequency}Hz")
+        self.statusBar().showMessage(f"开始正弦指令 - 中心:{center}mm, 振幅:{amplitude}mm, 频率:{frequency}Hz (传输周期:5ms, 符合协议要求)")
         
     def stop_sine_command(self):
         """停止正弦指令"""
@@ -2262,7 +2341,14 @@ class CANMonitorEnhancedGUI(QMainWindow):
         self.statusBar().showMessage("正弦指令已停止")
         
     def send_sine_frame(self, center, amplitude, frequency):
-        """发送正弦位移指令"""
+        """
+        发送正弦位移指令
+        根据新协议要求：
+        - CAN ID: 0x01121101
+        - Byte0: 0xFF表示指令有效
+        - Byte1~Byte4: 位移指令，4字节，无符号整型，0.01mm量纲
+        - 传输周期：5ms (200Hz)
+        """
         if not self.chn_handle or not self.sine_start_time:
             return
             
@@ -2275,7 +2361,7 @@ class CANMonitorEnhancedGUI(QMainWindow):
         sine_value = center + amplitude * np.sin(2 * np.pi * frequency * elapsed_time)
         
         # 限制在有效范围内
-        sine_value = max(0, min(655.35, sine_value))  # 限制在0-655.35mm范围内
+        sine_value = max(0, min(1500.0, sine_value))  # 限制在0-1500mm范围内
         
         # 构建CAN帧
         can_id = 0x01121101
@@ -2287,9 +2373,10 @@ class CANMonitorEnhancedGUI(QMainWindow):
         else:
             data[0] = 0x00  # 指令无效，位移非使能
             
-        # 位移指令：转换为0.01mm单位
+        # 位移指令：转换为0.01mm单位，使用4个字节存储
+        # 根据协议：Byte1~Byte4为位移指令，无符号整型，0.01mm量纲
         raw_value = int(sine_value * 100)  # 转换为0.01mm单位
-        data[1:3] = raw_value.to_bytes(2, byteorder='big', signed=False)  # 大端序
+        data[1:5] = raw_value.to_bytes(4, byteorder='big', signed=False)  # 4字节，大端序，无符号
         
         # 组帧
         frame = zlgcan.ZCAN_CAN_FRAME()
